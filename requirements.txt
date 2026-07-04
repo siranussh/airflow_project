@@ -4,3 +4,4 @@ pandas>=2.2.0
 rdkit>=2023.9.1
 pandera>=0.20.0
 soda-core-postgres>=3.3.0
+scikit-learn>=1.4.0
