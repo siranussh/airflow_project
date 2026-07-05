@@ -40,6 +40,44 @@ def _upload_df_to_s3(s3, df: pd.DataFrame, key: str) -> None:
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue().encode())
 
 
+def _output_exists(s3, dataset_id: str) -> bool:
+    key = f"{S3_OUTPUT_PREFIX}/{dataset_id}_results.csv"
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def get_new_datasets(**context) -> None:
+    s3 = _get_s3()
+    overwrite = context["params"]["overwrite"]
+    last_run: datetime = context["data_interval_start"]
+
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_INPUT_PREFIX + "/")
+    objects = response.get("Contents", [])
+
+    new_scaffold_ids = set()
+    for obj in objects:
+        key = obj["Key"]
+        last_modified = obj["LastModified"].replace(tzinfo=None)
+
+        if key.endswith("_scaffolds.csv"):
+            if last_modified > last_run.replace(tzinfo=None):
+                dataset_id = key.split("/")[-1].replace("_scaffolds.csv", "")
+                new_scaffold_ids.add(dataset_id)
+
+    datasets_to_process = []
+    for dataset_id in new_scaffold_ids:
+        if overwrite or not _output_exists(s3, dataset_id):
+            datasets_to_process.append(dataset_id)
+        else:
+            log.info("Skipping %s — results already exist and overwrite=False", dataset_id)
+
+    log.info("Datasets to process: %s", datasets_to_process)
+    context["ti"].xcom_push("dataset_ids", datasets_to_process)
+
+
 def fetch_files(dataset_id: str, **context) -> None:
     s3 = _get_s3()
 
@@ -150,6 +188,24 @@ def upload_results(dataset_id: str, **context) -> None:
     log.info("Uploaded %d molecules to s3://%s/%s", len(clustered_df), S3_BUCKET, out_key)
 
 
+def process_all_datasets(**context) -> None:
+    ti = context["ti"]
+    dataset_ids = ti.xcom_pull(task_ids="get_new_datasets", key="dataset_ids")
+
+    if not dataset_ids:
+        log.info("No new datasets to process.")
+        return
+
+    for dataset_id in dataset_ids:
+        log.info("Processing dataset: %s", dataset_id)
+        fetch_files(dataset_id=dataset_id, **context)
+        generate_molecules(**context)
+        calculate_properties(**context)
+        cluster_molecules(**context)
+        upload_results(dataset_id=dataset_id, **context)
+        log.info("Finished dataset: %s", dataset_id)
+
+
 default_args = {
     "owner":            "siranush_hakobyan",
     "retries":          1,
@@ -158,47 +214,30 @@ default_args = {
 }
 
 with DAG(
-    dag_id="drug_discovery_dag",
-    description="Cheminformatics pipeline: molecule generation → properties → clustering",
+    dag_id="drug_discovery_dag_schedule",
+    description="Cheminformatics pipeline: weekly schedule, processes all new S3 files",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule=None,
+    schedule="@weekly",
     catchup=False,
-    tags=["cheminformatics", "drug-discovery", "step1"],
+    tags=["cheminformatics", "drug-discovery", "step2"],
     params={
-        "dataset_id": Param(
-            default="",
-            type="string",
-            description="Expects <dataset_id>_scaffolds.csv and <dataset_id>_r_groups.csv in S3.",
+        "overwrite": Param(
+            default=False,
+            type="boolean",
+            description="If True, reprocess all datasets even if results already exist.",
         ),
     },
 ) as dag:
 
-    t_fetch = PythonOperator(
-        task_id="fetch_files",
-        python_callable=fetch_files,
-        op_kwargs={"dataset_id": "{{ params.dataset_id }}"},
+    t_get_datasets = PythonOperator(
+        task_id="get_new_datasets",
+        python_callable=get_new_datasets,
     )
 
-    t_generate = PythonOperator(
-        task_id="generate_molecules",
-        python_callable=generate_molecules,
+    t_process_all = PythonOperator(
+        task_id="process_all_datasets",
+        python_callable=process_all_datasets,
     )
 
-    t_props = PythonOperator(
-        task_id="calculate_properties",
-        python_callable=calculate_properties,
-    )
-
-    t_cluster = PythonOperator(
-        task_id="cluster_molecules",
-        python_callable=cluster_molecules,
-    )
-
-    t_upload = PythonOperator(
-        task_id="upload_results",
-        python_callable=upload_results,
-        op_kwargs={"dataset_id": "{{ params.dataset_id }}"},
-    )
-
-    t_fetch >> t_generate >> t_props >> t_cluster >> t_upload
+    t_get_datasets >> t_process_all
