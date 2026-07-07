@@ -65,7 +65,7 @@ def send_teams_alert(context):
     }
     response = requests.post(webhook_url, json=message, timeout=30)
 
-    if response.status_code == http.HTTPMethod.OK:
+    if response.status_code == 200:
         logging.info('Alert send successfully')
     else:
         logging.error(f'Failed to send message to Teams: {response.status_code} {response.text}')

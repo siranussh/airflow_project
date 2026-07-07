@@ -51,37 +51,7 @@ def _output_exists(s3, dataset_id: str) -> bool:
         return False
 
 
-def get_new_datasets(**context) -> None:
-    s3 = _get_s3()
-    overwrite = context["params"]["overwrite"]
-    last_run: datetime = context["data_interval_start"]
-
-    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_INPUT_PREFIX + "/")
-    objects = response.get("Contents", [])
-
-    new_scaffold_ids = set()
-    for obj in objects:
-        key = obj["Key"]
-        last_modified = obj["LastModified"].replace(tzinfo=None)
-        if key.endswith("_scaffolds.csv"):
-            if last_modified > last_run.replace(tzinfo=None):
-                dataset_id = key.split("/")[-1].replace("_scaffolds.csv", "")
-                new_scaffold_ids.add(dataset_id)
-
-    datasets_to_process = []
-    for dataset_id in new_scaffold_ids:
-        if overwrite or not _output_exists(s3, dataset_id):
-            datasets_to_process.append(dataset_id)
-        else:
-            log.info("Skipping %s — results already exist and overwrite=False", dataset_id)
-
-    log.info("Datasets to process: %s", datasets_to_process)
-    context["ti"].xcom_push("dataset_ids", datasets_to_process)
-
-
-def fetch_files(dataset_id: str, **context) -> None:
-    s3 = _get_s3()
-
+def fetch_files(s3, dataset_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     scaffold_key = f"{S3_INPUT_PREFIX}/{dataset_id}_scaffolds.csv"
     rgroup_key   = f"{S3_INPUT_PREFIX}/{dataset_id}_r_groups.csv"
 
@@ -93,37 +63,43 @@ def fetch_files(dataset_id: str, **context) -> None:
             raise ValueError(f"{name} CSV is missing the required 'smiles' column")
 
     log.info("Found %d scaffolds and %d r-groups", len(scaffolds), len(r_groups))
-
-    ti = context["ti"]
-    ti.xcom_push("scaffolds_json", scaffolds.to_json())
-    ti.xcom_push("r_groups_json",  r_groups.to_json())
+    return scaffolds, r_groups
 
 
-def check_input_quality(**context) -> None:
-
-    ti = context["ti"]
-    scaffolds = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="scaffolds_json"))
-    r_groups  = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="r_groups_json"))
-
+def check_input_quality(scaffolds: pd.DataFrame, r_groups: pd.DataFrame) -> None:
     if len(scaffolds) == 0:
         raise ValueError("Quality check failed: scaffolds file is empty")
     if len(r_groups) == 0:
         raise ValueError("Quality check failed: r_groups file is empty")
 
     invalid_scaffolds = scaffolds[~scaffolds["smiles"].str.contains(r"\*")]
+    multiple_attachment = scaffolds[scaffolds["smiles"].str.count(r"\*") > 1]
+
     if len(invalid_scaffolds) > 0:
         raise ValueError(
             f"Quality check failed: {len(invalid_scaffolds)} scaffolds missing attachment point '*'"
+        )
+    if len(multiple_attachment) > 0:
+        raise ValueError(
+            f"Quality check failed: {len(multiple_attachment)} scaffolds have more than one '*' attachment point"
+        )
+
+    invalid_r_groups = r_groups[~r_groups["smiles"].str.contains(r"\*")]
+    multiple_attachment_rg = r_groups[r_groups["smiles"].str.count(r"\*") > 1]
+
+    if len(invalid_r_groups) > 0:
+        raise ValueError(
+            f"Quality check failed: {len(invalid_r_groups)} r_groups missing attachment point '*'"
+        )
+    if len(multiple_attachment_rg) > 0:
+        raise ValueError(
+            f"Quality check failed: {len(multiple_attachment_rg)} r_groups have more than one '*' attachment point"
         )
 
     log.info("Input quality checks passed ✅")
 
 
-def generate_molecules(**context) -> None:
-    ti = context["ti"]
-    scaffolds = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="scaffolds_json"))
-    r_groups  = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="r_groups_json"))
-
+def generate_molecules(scaffolds: pd.DataFrame, r_groups: pd.DataFrame) -> pd.DataFrame:
     records = []
 
     for (_, sc_row), (_, rg_row) in product(scaffolds.iterrows(), r_groups.iterrows()):
@@ -146,21 +122,16 @@ def generate_molecules(**context) -> None:
 
     molecules_df = pd.DataFrame(records)
     log.info("Generated %d valid molecules", len(molecules_df))
-    ti.xcom_push("molecules_json", molecules_df.to_json())
+    return molecules_df
 
 
-def check_molecules_quality(**context) -> None:
-    ti = context["ti"]
-    scaffolds    = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="scaffolds_json"))
-    r_groups     = pd.read_json(ti.xcom_pull(task_ids="fetch_files", key="r_groups_json"))
-    molecules_df = pd.read_json(ti.xcom_pull(task_ids="generate_molecules", key="molecules_json"))
-
+def check_molecules_quality(scaffolds: pd.DataFrame, r_groups: pd.DataFrame, molecules_df: pd.DataFrame) -> None:
     if len(molecules_df) == 0:
         raise ValueError("Quality check failed: no valid molecules were generated")
 
     duplicates = molecules_df["smiles"].duplicated().sum()
     if duplicates > 0:
-        log.warning("Found %d duplicate SMILES — they will be kept but flagged", duplicates)
+        log.warning("Found %d duplicate SMILES", duplicates)
 
     total_combinations = len(scaffolds) * len(r_groups)
     valid_rate = len(molecules_df) / total_combinations
@@ -173,12 +144,7 @@ def check_molecules_quality(**context) -> None:
     log.info("Molecule quality checks passed ✅ (%d molecules, %.1f%% valid)", len(molecules_df), valid_rate * 100)
 
 
-def calculate_properties(**context) -> None:
-    ti = context["ti"]
-    molecules_df = pd.read_json(
-        ti.xcom_pull(task_ids="generate_molecules", key="molecules_json")
-    )
-
+def calculate_properties(molecules_df: pd.DataFrame) -> pd.DataFrame:
     def calc_props(smi: str) -> dict:
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
@@ -199,14 +165,10 @@ def calculate_properties(**context) -> None:
     result.dropna(inplace=True)
 
     log.info("Calculated properties for %d molecules", len(result))
-    ti.xcom_push("props_json", result.to_json())
+    return result
 
 
-def check_properties_quality(**context) -> None:
-  
-    ti = context["ti"]
-    props_df = pd.read_json(ti.xcom_pull(task_ids="calculate_properties", key="props_json"))
-
+def check_properties_quality(props_df: pd.DataFrame) -> None:
     feature_cols = ["logP", "HBA", "HBD", "MW", "TPSA", "QED"]
 
     null_counts = props_df[feature_cols].isnull().sum()
@@ -225,12 +187,7 @@ def check_properties_quality(**context) -> None:
     log.info("Property quality checks passed ✅")
 
 
-def cluster_molecules(**context) -> None:
-    ti = context["ti"]
-    props_df = pd.read_json(
-        ti.xcom_pull(task_ids="calculate_properties", key="props_json")
-    )
-
+def cluster_molecules(props_df: pd.DataFrame) -> pd.DataFrame:
     feature_cols = ["logP", "HBA", "HBD", "MW", "TPSA", "QED"]
     X = props_df[feature_cols].values
     X_scaled = StandardScaler().fit_transform(X)
@@ -240,20 +197,41 @@ def cluster_molecules(**context) -> None:
     props_df["cluster"] = kmeans.fit_predict(X_scaled)
 
     log.info("Assigned molecules into %d clusters", k)
-    ti.xcom_push("clustered_json", props_df.to_json())
+    return props_df
 
 
-def upload_results(dataset_id: str, **context) -> None:
-    ti = context["ti"]
-    clustered_df = pd.read_json(
-        ti.xcom_pull(task_ids="cluster_molecules", key="clustered_json")
-    )
-
-    s3 = _get_s3()
+def upload_results(s3, dataset_id: str, clustered_df: pd.DataFrame) -> None:
     out_key = f"{S3_OUTPUT_PREFIX}/{dataset_id}_results.csv"
     _upload_df_to_s3(s3, clustered_df, out_key)
-
     log.info("Uploaded %d molecules to s3://%s/%s", len(clustered_df), S3_BUCKET, out_key)
+
+
+def get_new_datasets(**context) -> None:
+    s3 = _get_s3()
+    overwrite = context["params"]["overwrite"]
+    last_run: datetime = context["data_interval_start"]
+
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_INPUT_PREFIX + "/")
+    objects = response.get("Contents", [])
+
+    new_scaffold_ids = set()
+    for obj in objects:
+        key = obj["Key"]
+        last_modified = obj["LastModified"].replace(tzinfo=None)
+        if key.endswith("_scaffolds.csv"):
+            if overwrite or last_modified > last_run.replace(tzinfo=None):
+                dataset_id = key.replace(f"{S3_INPUT_PREFIX}/", "").replace("_scaffolds.csv", "")
+                new_scaffold_ids.add(dataset_id)
+
+    datasets_to_process = []
+    for dataset_id in new_scaffold_ids:
+        if overwrite or not _output_exists(s3, dataset_id):
+            datasets_to_process.append(dataset_id)
+        else:
+            log.info("Skipping %s — results already exist and overwrite=False", dataset_id)
+
+    log.info("Datasets to process: %s", datasets_to_process)
+    context["ti"].xcom_push("dataset_ids", datasets_to_process)
 
 
 def process_all_datasets(**context) -> None:
@@ -264,16 +242,23 @@ def process_all_datasets(**context) -> None:
         log.info("No new datasets to process.")
         return
 
+    s3 = _get_s3()
+
     for dataset_id in dataset_ids:
         log.info("Processing dataset: %s", dataset_id)
-        fetch_files(dataset_id=dataset_id, **context)
-        check_input_quality(**context)
-        generate_molecules(**context)
-        check_molecules_quality(**context)
-        calculate_properties(**context)
-        check_properties_quality(**context)
-        cluster_molecules(**context)
-        upload_results(dataset_id=dataset_id, **context)
+
+        scaffolds, r_groups = fetch_files(s3, dataset_id)
+        check_input_quality(scaffolds, r_groups)
+
+        molecules_df = generate_molecules(scaffolds, r_groups)
+        check_molecules_quality(scaffolds, r_groups, molecules_df)
+
+        props_df = calculate_properties(molecules_df)
+        check_properties_quality(props_df)
+
+        clustered_df = cluster_molecules(props_df)
+        upload_results(s3, dataset_id, clustered_df)
+
         log.info("Finished dataset: %s", dataset_id)
 
 
